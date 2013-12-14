@@ -100,6 +100,10 @@ VideoEngine::VideoEngine():
     _temp_width(0),
     _temp_height(0),
     _smooth_pixel_art(true),
+    _transformed_vertex_array_ptr(NULL),
+    _vertex_array_ptr(NULL),
+    _vertex_array_stride(0),
+    _vertex_array_size(0),
     _initialized(false)
 {
     _current_context.blend = 0;
@@ -113,6 +117,8 @@ VideoEngine::VideoEngine():
     _current_context.scissor_rectangle = ScreenRect(0, 0, VIDEO_STANDARD_RES_WIDTH,
                                          VIDEO_STANDARD_RES_HEIGHT);
     _current_context.scissoring_enabled = false;
+
+    _transform_stack.push(Transform2D());
 
     for(uint32 sample = 0; sample < FPS_SAMPLES; sample++)
         _fps_samples[sample] = 0;
@@ -689,6 +695,48 @@ void VideoEngine::DisableTextureCoordArray()
     }
 }
 
+void VideoEngine::SetVertexPointer(GLint vertex_size, GLsizei stride, const float *ptr)
+{
+    assert(vertex_size > 0);
+    assert(stride >= 0);
+    assert(ptr);
+
+    if (stride == 0) {
+        stride = vertex_size * sizeof(float);
+    }
+
+    _vertex_array_ptr = ptr;
+    _vertex_array_stride = stride;
+    _vertex_array_size = vertex_size;
+}
+
+void VideoEngine::DrawArrays(GLenum mode, GLint first, GLsizei array_count)
+{
+    if (array_count == 0)
+        return;
+
+    assert(_vertex_array_ptr);
+    assert(first >= 0);
+
+    int stride_float = _vertex_array_stride / sizeof(float);
+
+    // resize transformed_vertex array if needed
+    _transformed_vertex_array.resize(stride_float * array_count);
+    if (_transformed_vertex_array_ptr != &_transformed_vertex_array[0]) {
+        _transformed_vertex_array_ptr = &_transformed_vertex_array[0];
+         glVertexPointer(_vertex_array_size, GL_FLOAT, _vertex_array_stride, _transformed_vertex_array_ptr);
+    }
+
+    // apply transform
+    _transform_stack.top().Apply(
+        _vertex_array_ptr + first * stride_float,
+        _transformed_vertex_array_ptr,
+        array_count,
+        _vertex_array_stride);
+
+    glDrawArrays(mode, 0, array_count);
+}
+
 void VideoEngine::SetScissorRect(float left, float right, float bottom, float top)
 {
     _current_context.scissor_rectangle = CalculateScreenRect(left, right, bottom, top);
@@ -751,41 +799,35 @@ ScreenRect VideoEngine::CalculateScreenRect(float left, float right, float botto
 
 void VideoEngine::Move(float x, float y)
 {
-    glLoadIdentity();
-    glTranslatef(x, y, 0);
+    _transform_stack.top().Reset();
+    _transform_stack.top().Translate(x, y);
     _x_cursor = x;
     _y_cursor = y;
 }
 
-
-
 void VideoEngine::MoveRelative(float x, float y)
 {
-    glTranslatef(x, y, 0);
+    _transform_stack.top().Translate(x, y);
     _x_cursor += x;
     _y_cursor += y;
 }
 
 void VideoEngine::PushMatrix()
 {
-    glPushMatrix();
+    _transform_stack.push(_transform_stack.top());
 }
 
 void VideoEngine::PopMatrix()
 {
-    glPopMatrix();
+    _transform_stack.pop();
 }
 
 void VideoEngine::PushState()
 {
-    // Push current modelview transformation
-    glMatrixMode(GL_MODELVIEW);
     PushMatrix();
 
     _context_stack.push(_current_context);
 }
-
-
 
 void VideoEngine::PopState()
 {
@@ -798,8 +840,6 @@ void VideoEngine::PopState()
     _current_context = _context_stack.top();
     _context_stack.pop();
 
-    // Restore the modelview transformation
-    glMatrixMode(GL_MODELVIEW);
     PopMatrix();
     glViewport(_current_context.viewport.left, _current_context.viewport.top, _current_context.viewport.width, _current_context.viewport.height);
 
@@ -817,19 +857,12 @@ void VideoEngine::PopState()
 
 void VideoEngine::Rotate(float angle)
 {
-    glRotatef(angle, 0, 0, 1);
+    _transform_stack.top().Rotate(angle);
 }
 
 void VideoEngine::Scale(float x, float y)
 {
-    glScalef(x, y, 1.0f);
-}
-
-void VideoEngine::SetTransform(float matrix[16])
-{
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glLoadMatrixf(matrix);
+    _transform_stack.top().Scale(x, y);
 }
 
 void VideoEngine::DrawFadeEffect()
@@ -1124,6 +1157,9 @@ void VideoEngine::DrawLine(float x1, float y1, float x2, float y2, float width, 
         x1, y1,
         x2, y2
     };
+
+    _transformed_vertex_array_ptr = vert_coords;
+
     EnableBlending();
     DisableTexture2D();
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Normal blending
@@ -1136,15 +1172,14 @@ void VideoEngine::DrawLine(float x1, float y1, float x2, float y2, float width, 
     DisableColorArray();
     DisableTextureCoordArray();
     glColor4fv((GLfloat *)color.GetColors());
-    glVertexPointer(2, GL_FLOAT, 0, vert_coords);
-    glDrawArrays(GL_LINES, 0, 2);
+    SetVertexPointer(2, 0, vert_coords);
+    DrawArrays(GL_LINES, 0, 2);
     glPopAttrib(); // GL_LINE_WIDTH
 }
 
 void VideoEngine::DrawGrid(float x, float y, float x_step, float y_step, const Color &c)
 {
     PushState();
-
     Move(0, 0);
 
     float x_max = _current_context.coordinate_system.GetRight();
@@ -1159,6 +1194,7 @@ void VideoEngine::DrawGrid(float x, float y, float x_step, float y_step, const C
         vertices.push_back(_current_context.coordinate_system.GetTop());
         num_vertices += 2;
     }
+
     for(; y < y_max; y += y_step) {
         vertices.push_back(_current_context.coordinate_system.GetLeft());
         vertices.push_back(y);
@@ -1169,8 +1205,8 @@ void VideoEngine::DrawGrid(float x, float y, float x_step, float y_step, const C
     glColor4fv(&c[0]);
     DisableTexture2D();
     EnableVertexArray();
-    glVertexPointer(2, GL_FLOAT, 0, &(vertices[0]));
-    glDrawArrays(GL_LINES, 0, num_vertices);
+    SetVertexPointer(2, 0, &(vertices[0]));
+    DrawArrays(GL_LINES, 0, num_vertices);
 
     PopState();
 }

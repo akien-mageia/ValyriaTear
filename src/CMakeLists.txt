@@ -336,6 +336,7 @@ engine/video/fade.h
 engine/video/fade.cpp
 engine/video/text.cpp
 engine/video/text.h
+engine/video/transform2d.h
 engine/video/shake.h
 engine/video/interpolator.cpp
 engine/video/interpolator.h
